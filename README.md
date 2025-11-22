@@ -7,7 +7,6 @@ Objetivo principal: Crear una base de datos con imágenes de ≥10 elementos de 
 
 Pipeline: web scraping → pre-procesamiento/limpieza (ETL) → almacenamiento (disk/DB) → despliegue en Streamlit.
 
-El repositorio de referencia usado: https://github.com/Sosa21-byte/Laboratorio-5.
 
 2. Archivos relevantes
 
@@ -27,11 +26,11 @@ Ejemplo requirements.txt sugerido:
 
 requests
 beautifulsoup4
-selenium          # si usas páginas con JS
+selenium          
 pillow
 opencv-python
 imagehash
 sqlalchemy
-psycopg2-binary   # opcional, si usas Postgres
+psycopg2-binary   
 streamlit
 tqdm
