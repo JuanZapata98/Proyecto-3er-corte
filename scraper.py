@@ -19,7 +19,13 @@ DEFAULT_KEYWORDS = [
     "multimeter",
     "oscilloscope",
     "function generator",
-    "dc power supply"
+    "dc power supply",
+    "raspberry pi",
+    "ac power supply",
+    "breadboard",
+    "transformer",
+    "breaker",
+    "arduino"
 ]
 
 
