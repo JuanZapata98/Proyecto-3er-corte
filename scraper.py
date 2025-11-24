@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
+"""
+Scraper de imágenes usando Bing (HTML), compatible con Docker y MySQL.
+"""
 
 import os
 import re
 import time
-import json
 import argparse
 import requests
+import mysql.connector
+from PIL import Image
 from urllib.parse import urlencode
 from bs4 import BeautifulSoup
 
+# -------- CONFIG (sobrescribibles vía variables de entorno) ----------
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36"
 }
 
 VALID_EXT = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
@@ -19,178 +25,190 @@ DEFAULT_KEYWORDS = [
     "multimeter",
     "oscilloscope",
     "function generator",
-    "dc power supply",
-    "raspberry pi",
-    "ac power supply",
-    "breadboard",
-    "transformer",
-    "breaker",
-    "arduino"
+    "dc power supply"
 ]
 
+# --- Base de datos desde variables de entorno (Docker-friendly)
+DB_HOST = os.getenv("DB_HOST", "host.docker.internal")
+DB_USER = os.getenv("DB_USER", "etl_user")
+DB_PASS = os.getenv("DB_PASS", "12345")
+DB_NAME = os.getenv("DB_NAME", "etl_imagenes")
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+# -------- Helpers -------------------------------------------------------
 def ensure_folder(folder):
     os.makedirs(folder, exist_ok=True)
 
+def _log(*args):
+    print(*args)
 
-def get_vqd_token(query):
-    """Obtiene el token necesario para la API no oficial de DuckDuckGo."""
-    params = {"q": query}
-    url = "https://duckduckgo.com/?" + urlencode(params)
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-
-    # buscar token vqd
-    m = re.search(r"vqd='([\d-]+)'", resp.text)
-    if not m:
-        m = re.search(r'vqd="([\d-]+)"', resp.text)
-    if not m:
-        m = re.search(r'vqd=([\d-]+)&', resp.text)
-    return m.group(1) if m else None
-
-
-def duckduckgo_search_images(query, max_results=30):
-    """Obtiene URLs de imágenes usando el endpoint no oficial de DDG."""
-    urls = []
-
-    vqd = get_vqd_token(query)
-    if not vqd:
-        print(" No se pudo obtener token vqd. Intentando método simple…")
-        return fallback_search_ddg(query, max_results)
-
-    session = requests.Session()
+# -------- BING SCRAPER ---------------------------------------------------
+def bing_search_images(query, max_results=200, session=None):
+    """
+    Scraper de imágenes de Bing vía HTML.
+    No requiere API, no tiene límite inferior, funciona perfecto en Docker.
+    """
+    session = session or requests.Session()
     session.headers.update(HEADERS)
 
-    params = {
-        "l": "us-en",
-        "o": "json",
-        "q": query,
-        "vqd": vqd
-    }
-    endpoint = "https://duckduckgo.com/i.js"
+    search_url = "https://www.bing.com/images/search"
+    params = {"q": query, "form": "HDRSC2"}
 
-    while len(urls) < max_results:
-        try:
-            r = session.get(endpoint, params=params, timeout=15)
-            r.raise_for_status()
-
-            data = r.json()
-            results = data.get("results", [])
-
-            if not results:
-                break
-
-            for item in results:
-                img = item.get("image") or item.get("thumbnail")
-                if img:
-                    urls.append(img)
-                    if len(urls) >= max_results:
-                        break
-
-            if "next" in data:
-                endpoint = "https://duckduckgo.com" + data["next"]
-            else:
-                break
-
-            time.sleep(0.3)
-
-        except Exception:
-            break
-
-    return urls[:max_results]
-
-
-def fallback_search_ddg(query, max_results=30):
-    """Método muy simple: scrapea el HTML del buscador (menos imágenes)."""
-    urls = []
-    url = "https://duckduckgo.com/?q=" + urlencode({"q": query})
-
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    for img in soup.select("img"):
-        src = img.get("src") or img.get("data-src")
-        if src and src.startswith("http"):
-            urls.append(src)
-            if len(urls) >= max_results:
-                break
-
-    return urls[:max_results]
-
-
-def download_image(url, folder):
-    """Descarga una imagen y valida el content-type."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = session.get(search_url, params=params, timeout=20)
         r.raise_for_status()
     except Exception as e:
-        return False, f"Request error: {e}"
+        _log("[ERROR] Bing request failed:", e)
+        return []
 
-    ct = r.headers.get("Content-Type", "")
-    if not ct.startswith("image/"):
-        return False, f"Not image: {ct}"
+    soup = BeautifulSoup(r.text, "html.parser")
+    urls = []
 
-    ext = ".jpg"
-    for e in VALID_EXT:
-        if url.lower().endswith(e):
-            ext = e
-            break
+    # "iusc" contiene JSON con murl/turl
+    for tag in soup.find_all("a", class_="iusc"):
+        try:
+            m_json = tag.get("m")
+            if not m_json:
+                continue
 
-    fname = f"{int(time.time()*1000)}_{abs(hash(url))%999999}{ext}"
-    path = os.path.join(folder, fname)
+            # Bing envía string estilo dict, lo convertimos
+            data = eval(m_json)  # seguro para este caso específico
+            url = data.get("murl")
 
-    with open(path, "wb") as f:
-        f.write(r.content)
+            if url and url.startswith("http"):
+                urls.append(url)
+                if len(urls) >= max_results:
+                    break
+        except Exception:
+            continue
 
-    return True, path
+    return urls
 
+# -------- DB helper ----------------------------------------------------
+def save_metadata_to_mysql(keyword, url, local_path):
+    """
+    Inserta metadatos de imágenes en MySQL.
+    """
+    try:
+        width = height = size_bytes = None
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-def gather_and_download(keywords, per_kw=20, folder="imagenes"):
+        try:
+            img = Image.open(local_path)
+            width, height = img.size
+            size_bytes = os.path.getsize(local_path)
+        except Exception as e:
+            _log("[WARN] No se pudo leer metadatos de imagen:", e)
+
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", DB_HOST),
+            user=os.getenv("DB_USER", DB_USER),
+            password=os.getenv("DB_PASS", DB_PASS),
+            database=os.getenv("DB_NAME", DB_NAME),
+            connection_timeout=10
+        )
+        cur = conn.cursor()
+
+        sql = """
+            INSERT INTO imagenes (keyword, url, local_path, width, height, size_bytes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+
+        cur.execute(sql, (keyword, url, local_path, width, height, size_bytes))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        _log(f"   [BD] Metadatos guardados → {local_path}")
+
+    except mysql.connector.Error as e:
+        _log("[BD] Error MySQL:", e)
+    except Exception as e:
+        _log("[BD] Error general:", e)
+
+# -------- DOWNLOAD ------------------------------------------------------
+def download_image(url, folder, keyword, session=None):
+    """
+    Descarga imagen con validación y la guarda.
+    Retorna (True, path) o (False, error)
+    """
+    session = session or requests.Session()
+    ensure_folder(folder)
+
+    for attempt in range(1, 4):
+        try:
+            r = session.get(url, headers=HEADERS, timeout=12, stream=True)
+            r.raise_for_status()
+
+            ctype = r.headers.get("Content-Type", "")
+            if not ctype.startswith("image/"):
+                return False, f"No es imagen (Content-Type={ctype})"
+
+            # Detectar extensión
+            ext = ".jpg"
+            lower = url.lower().split("?")[0]
+            for e in VALID_EXT:
+                if lower.endswith(e):
+                    ext = e
+                    break
+
+            fname = f"{int(time.time()*1000)}_{abs(hash(url))%999999}{ext}"
+            path = os.path.join(folder, fname)
+
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(1024*8):
+                    if chunk:
+                        f.write(chunk)
+
+            save_metadata_to_mysql(keyword, url, path)
+
+            return True, path
+        except Exception as e:
+            _log(f"[WARN] Reintento {attempt} falló para {url}: {e}")
+            time.sleep(0.5 * attempt)
+
+    return False, "Falló tras 3 intentos"
+
+# -------- Orchestrator --------------------------------------------------
+def gather_and_download(keywords, per_kw=200, folder="imagenes"):
     ensure_folder(folder)
     seen = set()
     total = 0
 
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     for kw in keywords:
-        print(f"\n=== Buscando '{kw}' ===")
-        urls = duckduckgo_search_images(kw, max_results=per_kw)
-        print(f"Encontradas {len(urls)} URLs")
+        _log(f"\n=== BING: Buscando '{kw}' ===")
+        urls = bing_search_images(kw, max_results=per_kw, session=session)
+        _log(f"Encontradas {len(urls)} URLs")
 
         count_kw = 0
+
         for u in urls:
             if u in seen:
                 continue
             seen.add(u)
 
-            ok, info = download_image(u, folder)
+            ok, info = download_image(u, folder, kw, session=session)
             if ok:
-                print(" + descargada:", info)
+                _log(" + descargada:", info)
                 total += 1
                 count_kw += 1
             else:
-                print("   error:", info)
+                _log("   error:", info)
 
-            time.sleep(0.15)
+            time.sleep(0.10)
 
-        print(f"Descargadas para '{kw}': {count_kw}")
+        _log(f"Descargadas para '{kw}': {count_kw}")
 
-    print(f"\nTotal descargadas: {total}")
+    _log(f"\nTOTAL descargadas: {total}")
 
-
+# -------- CLI -----------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--keywords", "-k", nargs="+", help="Keywords a buscar")
-    parser.add_argument("--per", "-p", type=int, default=20, help="Imágenes por keyword")
-    parser.add_argument("--out", "-o", default="imagenes", help="Carpeta salida")
-
+    parser.add_argument("--per", "-p", type=int, default=200, help="Imágenes por keyword")
+    parser.add_argument("--out", "-o", default="imagenes", help="Carpeta de salida")
     args = parser.parse_args()
 
     kws = args.keywords if args.keywords else DEFAULT_KEYWORDS
-
     gather_and_download(kws, per_kw=args.per, folder=args.out)

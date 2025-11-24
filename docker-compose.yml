@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-etl
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: etl_imagenes
+      MYSQL_USER: etl_user
+      MYSQL_PASSWORD: 12345
+    ports:
+      - "3307:3306"
+    command: --default-authentication-plugin=mysql_native_password --bind-address=0.0.0.0
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  scraper:
+    build: .
+    container_name: scraper-etl
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_USER: etl_user
+      DB_PASS: 12345
+      DB_NAME: etl_imagenes
+    volumes:
+      - ./imagenes:/app/imagenes
+    command: >
+      bash -lc "python scraper.py"
+
+volumes:
+  mysql_data:
